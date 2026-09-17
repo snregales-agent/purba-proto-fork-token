@@ -1,20 +1,16 @@
 name: Sign
 
-# Arm J. The deadlock arm G measured, and whether a second trigger clears it.
+# Arm L. Every commit of the branch carries the trailer, not the head alone.
 #
-# Arm G: `update-branch --rebase` gives the pull request three new SHAs, ZERO
-# check runs, and an approval that SURVIVES and re-points at the new head. No
-# further `pull_request_review` event ever fires, so nothing re-posts the
-# required context and the pull request is stuck.
-#
-# This version adds `synchronize`, which is the only event left that can see
-# the new head.
+# Arm I measured the head-only design: two of three commits reached `main` with
+# no acceptance record, which is what a commit of the second era looks like.
+# This replays the branch and writes the trailer into each commit that lacks one.
 
 on:
   pull_request_review:
     types: [submitted]
   pull_request:
-    types: [synchronize, opened, reopened]
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
@@ -22,8 +18,8 @@ permissions:
   checks: write
 
 jobs:
-  sign-job:
-    name: sign-job
+  sign:
+    name: sign
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,53 +33,57 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
-      - name: Sign if the head is approved
+      - name: Write the acceptance trailer into every commit, then report
         run: |
-          set -uo pipefail
+          set -euo pipefail
 
-          # Every page. The endpoint returns 30 per page, and one pull request
-          # here reported zero approvals unpaginated while carrying one.
           approver=$(gh api "repos/$R/pulls/$PR/reviews" --paginate \
             | jq -r '[.[] | select(.state == "APPROVED")] | last | .user.login // empty')
           approver_id=$(gh api "repos/$R/pulls/$PR/reviews" --paginate \
             | jq -r '[.[] | select(.state == "APPROVED")] | last | .user.id // empty')
 
-          {
-            echo "## Arm J -- event \`${{ github.event_name }}\`"
-            echo
-            echo "| field | value |"
-            echo "|---|---|"
-            echo "| approver found | \`${approver:-NONE}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
+          echo "## Arm L -- event \`${{ github.event_name }}\`" >> "$GITHUB_STEP_SUMMARY"
           if [ -z "$approver" ]; then
-            echo "no approval stands, so there is no acceptance to record"
-            echo "| outcome | \`no approval, context withheld\` |" >> "$GITHUB_STEP_SUMMARY"
+            echo "no approval stands, so the context is withheld" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
+          git fetch -q origin main
+          base=$(git merge-base FETCH_HEAD HEAD)
+          before=$(git rev-parse HEAD)
+          n=$(git rev-list --count "$base..HEAD")
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          export TRAILER="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
+          git rebase "$base" --exec \
+            'git log -1 --format="%(trailers:key=Accepted-by)" | grep -q . || git commit --amend --no-edit --trailer "$TRAILER"'
+
           head_sha=$(git rev-parse HEAD)
-          if git log -1 --format='%(trailers:key=Accepted-by)' | grep -q .; then
-            echo "| trailer | \`already present\` |" >> "$GITHUB_STEP_SUMMARY"
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit --amend --no-edit --trailer \
-              "Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
-            git push --force origin "HEAD:$REF" 2>&1 | tail -2
-            head_sha=$(git rev-parse HEAD)
-            echo "| trailer | \`written, pushed to $head_sha\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$head_sha" != "$before" ]; then
+            git push --force origin "HEAD:$REF"
           fi
 
-          id=$(gh api -X POST "repos/$R/check-runs" \
+          gh api -X POST "repos/$R/check-runs" \
             -f name="$CONTEXT" -f head_sha="$head_sha" -f status=completed \
             -f conclusion=success \
             -f output[title]="Accepted by @$approver" \
             -f output[summary]="The acceptance trailer was written from the approval." \
-            --jq '.id' 2>&1)
+            --jq '.id' > /dev/null
 
-          command sleep 15
           {
-            echo "| check run on \`${head_sha:0:7}\` | \`$id\` |"
-            echo "| mergeable_state | \`$(gh api "repos/$R/pulls/$PR" --jq .mergeable_state)\` |"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| approver | \`$approver\` |"
+            echo "| commits replayed | \`$n\` |"
+            echo "| head before | \`${before:0:7}\` |"
+            echo "| head after | \`${head_sha:0:7}\` |"
+            echo "| tree before | \`$(git rev-parse "$before^{tree}")\` |"
+            echo "| tree after | \`$(git rev-parse "$head_sha^{tree}")\` |"
+            echo
+            echo '```'
+            git log --format='%h %s -- Accepted-by=[%(trailers:key=Accepted-by,valueonly)]' "$base..HEAD"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
