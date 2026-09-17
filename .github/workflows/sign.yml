@@ -1,68 +1,27 @@
-# Acceptance for agent-written code, written into the commit.
+# Acceptance for agent-written code.
 #
-# An agent writes the commits here. A person accepts them. This workflow turns
-# that acceptance into an `Accepted-by:` trailer on every commit of the branch,
-# and then reports the required status check itself.
+#   the decision:  docs/decisions/liability-is-recorded-from-the-act-that-makes-it-true.md
+#   what you owe:  CONTRIBUTING.md
 #
-#   the decision: docs/decisions/liability-is-recorded-from-the-act-that-makes-it-true.md
-#   what a contributor owes: CONTRIBUTING.md
-#
-# Everything below was measured in a throwaway repository whose ruleset mirrors
-# `protect-main` with the admin bypass removed. The measurements are recorded on
-# https://github.com/kalonji-tools/purba/issues/103 and the workflows that made
-# them are on the `proto/103-check-run` branch.
-#
-# Five things break this file if you change them without knowing why.
-#
-#   1. TWO triggers, not one. Deriving the trailer from the approval suggests
-#      `pull_request_review` alone. That deadlocks. Once `main` moves, the
-#      branch must be updated, and an update gives the pull request new SHAs
-#      that carry NO check runs while the approval SURVIVES and re-points at
-#      the new head. No further review event can fire, so nothing would report
-#      the required context again and the pull request would be stuck with an
-#      approval that looks current. `synchronize` is the only event left that
-#      sees the new head.
-#
-#   2. The job is NOT named `Sign-off`. The required context is posted by the
-#      explicit call at the end of the job. A job named `sign` that fails, or
-#      that an `if:` skips, writes its check run under `sign` and cannot satisfy
-#      the gate by accident. The previous workflow could, which is why it
-#      carried no draft guard.
-#
-#   3. The fork refusal comes BEFORE the checkout. A fork pull request has no
-#      branch of that name in this repository, so `actions/checkout` fails
-#      first and any later step is unreachable. Measured: the job failed at
-#      checkout, the required context stayed absent, and the merge was refused.
-#      The gate holds either way. The step exists to say why.
-#
-#   4. The `grep -q .` guard is what makes the job idempotent. A commit that
-#      already carries the trailer is replayed and not amended, so the SHAs
-#      settle and the push stops. Without it the job rewrites the branch on
-#      every `synchronize` and never reaches a fixed point.
-#
-#   5. Every read of the reviews endpoint takes every page. It returns 30 per
-#      page, and one pull request here reported zero approvals unpaginated
-#      while carrying one.
-#
-# Known limit, not fixed: a contribution from a fork cannot carry the trailer.
-# The token there is read only, and `maintainer_can_modify` grants a person
-# rather than the Actions token. Both were measured.
-# https://github.com/kalonji-tools/purba/issues/102 decides that path.
+# Four things below are easy to change and hard to debug. Each one says why.
 name: Sign-off
 
 on:
+  # Keep both triggers.
+  # Updating a branch writes new commits, and a new commit has no check runs
+  # on it. The approval stays, so no review event arrives. With only
+  # `pull_request_review`, nothing would report the check again and the pull
+  # request could never merge.
   pull_request_review:
     types: [submitted]
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
 
-# One run of this workflow at a time per pull request, and never cancelled.
-# The job pushes before it reports the context, so a run cancelled between
-# those two acts would leave a rewritten branch with no required check and no
-# event left to retry it. Queueing is safe instead: a second run finds the
-# trailer already present, rewrites nothing, and reports the context again.
 concurrency:
   group: sign-${{ github.event.pull_request.number }}
+  # Never `true`. This job pushes first and reports the check second. Cancel
+  # it in between, and the branch keeps the rewrite but loses the check.
+  # Nothing runs again to add one.
   cancel-in-progress: false
 
 jobs:
@@ -70,11 +29,12 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
-      # The job reports the required context itself, against a SHA it created.
-      # An amended head carries zero check runs, so without this the context
-      # would never appear and the merge would be refused forever.
+      # This job rewrites the commits, and the new commits have no check runs
+      # on them. So the job reports the required check itself.
       checks: write
-    # NOT `Sign-off`. See note 2 in the header.
+    # Never call this job `Sign-off`. A job writes a check run under its own
+    # name, so that name must not be the required one. The last step reports
+    # `Sign-off` on purpose instead.
     name: sign
     runs-on: ubuntu-latest
     env:
@@ -83,11 +43,13 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
-      # Before the checkout, which is the step a fork pull request fails on.
+      # This step must stay first. A fork's branch does not exist in this
+      # repository. The checkout below fails on it. Any step placed after the
+      # checkout would never run.
       - name: Refuse a pull request from a fork
         if: github.event.pull_request.head.repo.full_name != github.repository
         run: |
-          echo "::error::A pull request from a fork cannot carry the acceptance trailer. The token here is read only, so this job cannot write it. purba accepts the contribution another way: see CONTRIBUTING.md."
+          echo "::error::This job cannot sign a pull request from a fork, because it is only allowed to read here. purba takes your contribution another way: see CONTRIBUTING.md."
           exit 1
 
       - uses: actions/checkout@v4
@@ -99,47 +61,38 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The approval that STANDS, not the one in the event payload. On a
-          # `synchronize` there is no payload approval at all, and that is the
-          # event this job exists to survive.
+          # Read the approval from the API, not from the event. A push event
+          # carries no approval, and a push is what this job has to survive.
           reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate)
           approver=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.login // empty' <<<"$reviews")
           approver_id=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.id // empty' <<<"$reviews")
 
-          # No approval, no acceptance, and therefore no context. The gate is
-          # the ABSENCE of the required check run, never a failing one, so this
-          # exits successfully and reports nothing.
+          # With no approval, write no check at all. A missing check already
+          # blocks the merge, so this job stops here and succeeds.
           if [ -z "$approver" ]; then
             echo "no approval stands on this head, so there is nothing to accept"
             exit 0
           fi
 
-          # The numeric id, because it survives a username change and a
-          # username-only address does not.
+          # The numeric id survives a username change. A username-only address
+          # does not.
           export TRAILER="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
 
           git fetch --quiet origin main
           base=$(git merge-base FETCH_HEAD HEAD)
           before=$(git rev-parse HEAD)
 
-          # The committer this writes is overwritten at merge: purba is
-          # rebase-only and a rebase merge sets the committer to whoever
-          # merged. Nothing here depends on it.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Every commit, not the head. On a three-commit pull request the
-          # head-only design left two commits on `main` with no acceptance
-          # record, which is indistinguishable from a commit written before
-          # this decision. See note 4 for the guard.
+          # The `grep` is what stops this repeating forever. A commit that
+          # already has the trailer is left alone. The commits stop changing, and
+          # the push below stops happening.
           git rebase "$base" --exec \
             'git log -1 --format="%(trailers:key=Accepted-by)" | grep -q . || git commit --amend --no-edit --trailer "$TRAILER"'
 
           head_sha=$(git rev-parse HEAD)
           if [ "$head_sha" != "$before" ]; then
-            # A push that leaves the tree unchanged does not dismiss the
-            # review, which is why one approval is enough. Measured across two
-            # actors, with a content-changing push as the control.
             git push --force origin "HEAD:$HEAD_REF"
           fi
 
