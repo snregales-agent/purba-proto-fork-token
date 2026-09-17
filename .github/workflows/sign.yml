@@ -46,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
     steps:
       # This step must stay first. A fork's branch does not exist in this
       # repository. The checkout below fails on it. Any step placed after the
@@ -82,7 +83,10 @@ jobs:
           # does not.
           export TRAILER="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
 
-          git fetch --quiet origin main
+          # The branch this pull request targets, not `main`. A pull request
+          # onto any other branch would otherwise be measured from the wrong
+          # place, and the job would rewrite commits it does not own.
+          git fetch --quiet origin "$BASE_REF"
           base=$(git merge-base FETCH_HEAD HEAD)
           before=$(git rev-parse HEAD)
 
