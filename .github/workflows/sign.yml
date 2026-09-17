@@ -44,6 +44,9 @@ jobs:
     # `Sign-off` on purpose instead.
     name: sign
     runs-on: ubuntu-latest
+    # Bounded, because `cancel-in-progress` is false and a hung run would hold
+    # the queue for six hours.
+    timeout-minutes: 10
     env:
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
       BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -79,6 +82,16 @@ jobs:
             exit 0
           fi
 
+          # These two are written into commit messages that can never be
+          # edited, so check their shape before writing them. GitHub allows only
+          # letters, digits and hyphens in a login today.
+          case "$approver" in
+            *[!A-Za-z0-9-]*) echo "::error::the approver login has a character this job will not write into a commit: $approver"; exit 1 ;;
+          esac
+          case "$approver_id" in
+            "" | *[!0-9]*) echo "::error::the approver id is not a number: $approver_id"; exit 1 ;;
+          esac
+
           # The numeric id survives a username change. A username-only address
           # does not.
           export TRAILER="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
@@ -99,6 +112,11 @@ jobs:
           # The `grep` is what stops this repeating forever. A commit that
           # already has the trailer is left alone. The commits stop changing, and
           # the push below stops happening.
+          #
+          # Keep the outer quotes single. `$TRAILER` then reaches the command
+          # through the environment, where it stays data. Double quotes would
+          # let the outer shell paste it in as code instead, and that was
+          # measured running a command hidden inside a login.
           git rebase "$base" --exec \
             'git log -1 --format="%(trailers:key=Accepted-by)" | grep -q . || git commit --amend --no-edit --trailer "$TRAILER"'
 
@@ -131,6 +149,7 @@ jobs:
     # thread, which is a guard too far downstream to rely on.
     if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     env:
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
