@@ -24,6 +24,13 @@ concurrency:
   # Nothing runs again to add one.
   cancel-in-progress: false
 
+# Both jobs talk to the same pull request through `gh`, so these sit here
+# rather than once in each job.
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
+  PR: ${{ github.event.pull_request.number }}
+
 jobs:
   sign:
     permissions:
@@ -38,9 +45,6 @@ jobs:
     name: sign
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GH_REPO: ${{ github.repository }}
-      PR: ${{ github.event.pull_request.number }}
       HEAD_REF: ${{ github.event.pull_request.head.ref }}
     steps:
       # This step must stay first. A fork's branch does not exist in this
@@ -82,6 +86,9 @@ jobs:
           base=$(git merge-base FETCH_HEAD HEAD)
           before=$(git rev-parse HEAD)
 
+          # A fresh checkout has no git identity, and `git commit` refuses to
+          # run without one. These two lines only satisfy that. The name does
+          # not survive: the merge replaces the committer.
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -107,3 +114,64 @@ jobs:
 
           echo "recorded acceptance by $approver on $head_sha"
 
+  decision-records:
+    permissions:
+      # This job writes a comment on the pull request. The sign job only reads
+      # one, so the two need different permissions.
+      pull-requests: write
+    name: Decision-record thread
+    # Separate from the gate, and deliberately not gated: this thread must be
+    # readable while the reviewer decides, not after they have approved.
+    # `pull_request` only. A review event carries the same payload, and the
+    # marker check below would then be the only thing stopping a second
+    # thread, which is a guard too far downstream to rely on.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Post the thread
+        run: |
+          set -euo pipefail
+
+          decisions=$(gh api "repos/$GH_REPO/pulls/$PR/files" --paginate --jq '.[].filename' | LC_ALL=C sort | grep '^docs/decisions/' || true)
+          if [ -z "$decisions" ]; then
+            echo "the diff does not touch docs/decisions, so no thread is owed"
+            exit 0
+          fi
+
+          # Anchoring is narrower than the documentation suggests, and all of
+          # this was measured against a live pull request rather than read:
+          # an inline comment is accepted only on a line inside a diff hunk;
+          # `subject_type` is REJECTED inside a review payload; and GraphQL's
+          # addPullRequestReviewThread with subjectType FILE returns a null
+          # thread and creates nothing. A file-level thread exists only through
+          # the standalone endpoint used below.
+          marker='<!-- purba:thread:decisions -->'
+          # `ready_for_review` fires again every time a draft is re-readied, so
+          # without this check one question would become several required
+          # resolutions.
+          existing=$(gh api "repos/$GH_REPO/pulls/$PR/comments" --paginate --jq '.[].body')
+          case "$existing" in
+            *"$marker"*)
+              echo "$marker is already present, skipping"
+              exit 0
+              ;;
+          esac
+
+          gh api "repos/$GH_REPO/pulls/$PR/comments" \
+            -f commit_id="$HEAD_SHA" -f path="$(head -1 <<<"$decisions")" -f subject_type=file \
+            -f body="**This pull request changes a decision record.**
+
+          $(sed 's|^|- \`|; s|$|\`|' <<<"$decisions")
+
+          A decision record states what this project decided and why, and it is read by people who were not in the conversation. Two things about it can never be checked by a tool:
+
+          > Two things are never gateable: whether a record states one decision, and whether it is still true.
+          > The code owner judges both, and is the only reader who can.
+
+          A third has already gone wrong once. **The Decision Outcome is written by a person, or the change does not merge.** An agent writing it satisfies the letter and voids the rule.
+
+          Resolve this thread when you have judged all three.
+          $marker"
+          echo "posted the decision-record thread"
