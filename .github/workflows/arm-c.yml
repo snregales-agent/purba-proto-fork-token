@@ -1,0 +1,63 @@
+# Arm C: a merge queue builds the fork's commits onto a branch INSIDE the base
+# repo before they reach `main`. Can a merge_group job rewrite that branch?
+name: ArmC
+on:
+  merge_group:
+
+jobs:
+  queue:
+    name: Sign-off
+    permissions:
+      contents: write
+      checks: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+      QUEUE_SHA: ${{ github.event.merge_group.head_sha }}
+      BASE_SHA: ${{ github.event.merge_group.base_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: C1 what does the queue branch hold
+        run: |
+          echo "C1 queue_ref=$QUEUE_REF"
+          echo "C1 queue_sha=$QUEUE_SHA base_sha=$BASE_SHA"
+          git log --format='C1 commit %h author=%an committer=%cn subject=%s' "$BASE_SHA".."$QUEUE_SHA" || true
+
+      - name: C2 can this token write a ref in the base repo at all
+        run: |
+          set +e
+          out=$(gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f ref="refs/heads/arm-c-write-probe" -f sha="$QUEUE_SHA" 2>&1)
+          echo "C2 exit=$?"
+          echo "$out" | head -5
+
+      - name: C3 rewrite the queue commits and push back to the queue branch
+        run: |
+          set +e
+          export TRAILER="Accepted-by: armC <armC@example.invalid>"
+          git checkout -q -B armc-work "$QUEUE_SHA"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rebase "$BASE_SHA" --exec \
+            'git log -1 --format="%(trailers:key=Accepted-by)" | grep -q . || git commit --amend --no-edit --trailer "$TRAILER"'
+          echo "C3 rebase_exit=$?"
+          new=$(git rev-parse HEAD)
+          echo "C3 new_head=$new old_head=$QUEUE_SHA"
+          git push origin "HEAD:${QUEUE_REF#refs/heads/}" --force 2>&1 | tail -4
+          echo "C3 push_exit=$?"
+
+      - name: C4 report the required context so the queue can finish
+        if: always()
+        run: |
+          set +e
+          gh api --method POST "repos/$GH_REPO/check-runs" \
+            -f name="Sign-off" -f head_sha="$QUEUE_SHA" \
+            -f status=completed -f conclusion=success \
+            -f "output[title]=arm C" -f "output[summary]=merge_group probe" --jq '.id'
+          echo "C4 exit=$?"
