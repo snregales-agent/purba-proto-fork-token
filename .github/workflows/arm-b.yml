@@ -1,0 +1,65 @@
+# Arm B: move the fork's commits INSIDE the base repo, rewrite them there,
+# and open a second pull request from the mirror branch.
+name: ArmB
+on:
+  pull_request_target:
+    types: [labeled]
+
+jobs:
+  mirror:
+    if: github.event.label.name == 'armB'
+    name: armB-mirror
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: B1 fetch the fork commits through the base repo
+        run: |
+          set +e
+          git fetch origin "refs/pull/$PR/head:pr-head" 2>&1 | tail -3
+          echo "B1 exit=$?"
+          git log --oneline origin/main..pr-head | sed 's/^/B1 commit /'
+
+      - name: B2 rewrite with the acceptance trailer on a mirror branch
+        run: |
+          set -euo pipefail
+          reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate)
+          approver=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.login // empty' <<<"$reviews")
+          approver_id=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.id // empty' <<<"$reviews")
+          if [ -z "$approver" ]; then echo "B2 no approval stands, stopping"; exit 1; fi
+          echo "B2 approver=$approver"
+          export TRAILER="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
+          base=$(git merge-base origin/main pr-head)
+          git checkout -B "accepted/pr-$PR" pr-head
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rebase "$base" --exec \
+            'git log -1 --format="%(trailers:key=Accepted-by)" | grep -q . || git commit --amend --no-edit --trailer "$TRAILER"'
+          git log --format='B2 %h author=%an committer=%cn trailers=%(trailers:key=Accepted-by,valueonly)' "$base"..HEAD
+
+      - name: B3 push the mirror branch into the base repo
+        run: |
+          set +e
+          git push origin "accepted/pr-$PR" --force 2>&1 | tail -3
+          echo "B3 exit=$?"
+
+      - name: B4 open the mirror pull request with GITHUB_TOKEN
+        run: |
+          set +e
+          url=$(gh pr create --base main --head "accepted/pr-$PR" \
+            --title "chore: accept #$PR" \
+            --body "Mirror of #$PR, rewritten with the acceptance trailer." 2>&1)
+          echo "B4 exit=$?"
+          echo "B4 $url"
