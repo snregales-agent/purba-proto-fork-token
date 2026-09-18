@@ -1,5 +1,9 @@
-# Arm B: move the fork's commits INSIDE the base repo, rewrite them there,
-# and open a second pull request from the mirror branch.
+# Arm B: move the fork's commits INSIDE the base repo verbatim, and let the
+# ordinary inside-repo gate handle the mirror branch. No rewrite happens here.
+#
+# The one thing this measures: does a pull request opened with GITHUB_TOKEN
+# start any workflow run? If it does not, `sign.yml` never fires on the mirror
+# and the required context never appears.
 name: ArmB
 on:
   pull_request_target:
@@ -19,7 +23,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
       PR: ${{ github.event.pull_request.number }}
-      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,38 +31,27 @@ jobs:
       - name: B1 fetch the fork commits through the base repo
         run: |
           set +e
-          git fetch origin "refs/pull/$PR/head:pr-head" 2>&1 | tail -3
-          echo "B1 exit=$?"
-          git log --oneline origin/main..pr-head | sed 's/^/B1 commit /'
+          git fetch origin "refs/pull/$PR/head:pr-head" 2>&1 | tail -2
+          echo "B1 fetch_exit=$?"
+          git log --format='B1 commit %h author=%an <%ae> committer=%cn' origin/main..pr-head
 
-      - name: B2 rewrite with the acceptance trailer on a mirror branch
-        run: |
-          set -euo pipefail
-          reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate)
-          approver=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.login // empty' <<<"$reviews")
-          approver_id=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.id // empty' <<<"$reviews")
-          if [ -z "$approver" ]; then echo "B2 no approval stands, stopping"; exit 1; fi
-          echo "B2 approver=$approver"
-          export TRAILER="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
-          base=$(git merge-base origin/main pr-head)
-          git checkout -B "accepted/pr-$PR" pr-head
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rebase "$base" --exec \
-            'git log -1 --format="%(trailers:key=Accepted-by)" | grep -q . || git commit --amend --no-edit --trailer "$TRAILER"'
-          git log --format='B2 %h author=%an committer=%cn trailers=%(trailers:key=Accepted-by,valueonly)' "$base"..HEAD
-
-      - name: B3 push the mirror branch into the base repo
+      - name: B2 push the fork commits verbatim to a branch in the base repo
         run: |
           set +e
-          git push origin "accepted/pr-$PR" --force 2>&1 | tail -3
-          echo "B3 exit=$?"
+          git push origin "pr-head:refs/heads/accepted/pr-$PR" --force 2>&1 | tail -3
+          echo "B2 push_exit=$?"
 
-      - name: B4 open the mirror pull request with GITHUB_TOKEN
+      - name: B3 open the mirror pull request with GITHUB_TOKEN
         run: |
           set +e
           url=$(gh pr create --base main --head "accepted/pr-$PR" \
-            --title "chore: accept #$PR" \
-            --body "Mirror of #$PR, rewritten with the acceptance trailer." 2>&1)
-          echo "B4 exit=$?"
-          echo "B4 $url"
+            --title "chore: accept #$PR from a fork" \
+            --body "Mirror of #$PR. The commits are the contributor's, unchanged." 2>&1)
+          echo "B3 create_exit=$?"
+          echo "B3 url=$url"
+          num=$(basename "$url")
+          echo "B3 mirror_pr=$num"
+          echo "B3 sleeping 25s, then listing the runs that event started"
+          sleep 25
+          gh api "repos/$GH_REPO/actions/runs?per_page=10" \
+            --jq '.workflow_runs[] | "B3 run \(.name) ev=\(.event) head=\(.head_branch) status=\(.status)"'
