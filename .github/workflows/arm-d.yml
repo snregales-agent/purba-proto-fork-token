@@ -1,0 +1,79 @@
+# Arm D: the maintainer writes the acceptance trailer onto the fork branch by
+# hand. This job never writes anything. It VERIFIES the trailer against the
+# approval the API reports, and reports the required context itself.
+#
+# `pull_request_target` runs the base repo's copy of this file, so a fork
+# cannot edit the code that judges it. That is stronger than the inside-repo
+# `sign` job, which runs the head's copy.
+name: ArmD
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: armd-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: armD-verify
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: D3 verify the trailer against the approval, then report
+        run: |
+          set -uo pipefail
+
+          reviews=$(gh api "repos/$GH_REPO/pulls/$PR/reviews" --paginate)
+          approver=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.login // empty' <<<"$reviews")
+          approver_id=$(jq -r '[.[] | select(.state == "APPROVED")] | last | .user.id // empty' <<<"$reviews")
+          if [ -z "$approver" ]; then
+            echo "D3 no approval stands, nothing to verify, no check written"
+            exit 0
+          fi
+          want="Accepted-by: $approver <$approver_id+$approver@users.noreply.github.com>"
+          echo "D3 want=$want"
+
+          git fetch --quiet origin "refs/pull/$PR/head:pr-head"
+          base=$(git merge-base "origin/$BASE_REF" pr-head)
+
+          bad=""
+          while read -r sha; do
+            got=$(git log -1 --format='%(trailers:key=Accepted-by,valueonly)' "$sha" | tr -d '\n')
+            origin=$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | tr -d '\n')
+            echo "D3 commit $(git rev-parse --short "$sha") accepted='$got' signed='$origin'"
+            [ -n "$origin" ] || bad="$bad $(git rev-parse --short "$sha"):no-origin"
+            [ "$got" = "${want#Accepted-by: }" ] || bad="$bad $(git rev-parse --short "$sha"):acceptance-mismatch"
+          done < <(git rev-list "$base"..pr-head)
+
+          if [ -n "$bad" ]; then
+            concl=failure
+            title="the branch does not carry the acceptance @$approver gave"
+            summary="Commits that do not match:$bad"
+          else
+            concl=success
+            title="Accepted by @$approver"
+            summary="Every commit carries the origin trailer and an acceptance naming the account that approved."
+          fi
+          echo "D3 conclusion=$concl$bad"
+
+          gh api --method POST "repos/$GH_REPO/check-runs" \
+            -f name="Sign-off" -f head_sha="$HEAD_SHA" \
+            -f status=completed -f conclusion="$concl" \
+            -f "output[title]=$title" -f "output[summary]=$summary" --jq '.conclusion'
